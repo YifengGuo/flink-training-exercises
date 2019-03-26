@@ -79,7 +79,8 @@ public class CarEventSort {
 		public void processElement(ConnectedCarEvent event, Context context, Collector<ConnectedCarEvent> out) throws Exception {
 			TimerService timerService = context.timerService();
 
-			if (context.timestamp() > timerService.currentWatermark()) {
+			if (context.timestamp() > timerService.currentWatermark()) {  // if current event's timestamp > current watermark -> meaning current event is not late
+				                                                          // on time events will be buffered in a pq
 				PriorityQueue<ConnectedCarEvent> queue = queueState.value();
 				if (queue == null) {
 					queue = new PriorityQueue<>(10);
@@ -88,6 +89,7 @@ public class CarEventSort {
 				queueState.update(queue);
 				timerService.registerEventTimeTimer(event.timestamp);
 			}
+			// late elements will be dropped
 		}
 
 		@Override
@@ -95,7 +97,7 @@ public class CarEventSort {
 			PriorityQueue<ConnectedCarEvent> queue = queueState.value();
 			Long watermark = context.timerService().currentWatermark();
 			ConnectedCarEvent head = queue.peek();
-			while (head != null && head.timestamp <= watermark) {
+			while (head != null && head.timestamp <= watermark) {  // make sure head is not late elements
 				out.collect(head);
 				queue.remove(head);
 				head = queue.peek();

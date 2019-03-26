@@ -22,6 +22,8 @@ import com.dataartisans.flinktraining.exercises.datastream_java.sources.TaxiFare
 import com.dataartisans.flinktraining.exercises.datastream_java.sources.TaxiRideSource;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.ExerciseBase;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.MissingSolutionException;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
@@ -77,17 +79,36 @@ public class RidesAndFaresExercise extends ExerciseBase {
 
 	public static class EnrichmentFunction extends RichCoFlatMapFunction<TaxiRide, TaxiFare, Tuple2<TaxiRide, TaxiFare>> {
 
+		private ValueState<TaxiRide> rideState;
+
+		private ValueState<TaxiFare> fareState;
+
 		@Override
 		public void open(Configuration config) throws Exception {
-			throw new MissingSolutionException();
+			rideState = getRuntimeContext().getState(new ValueStateDescriptor<TaxiRide>("ride state", TaxiRide.class));
+            fareState = getRuntimeContext().getState(new ValueStateDescriptor<TaxiFare>("fare state", TaxiFare.class));
 		}
 
 		@Override
 		public void flatMap1(TaxiRide ride, Collector<Tuple2<TaxiRide, TaxiFare>> out) throws Exception {
+		    TaxiFare statedFare = fareState.value();
+		    if (statedFare == null) {
+		        rideState.update(ride); // cannot merge, do nothing except update ride state
+            } else {
+		        fareState.clear();  // reset fare state before merging
+		        out.collect(new Tuple2<>(ride, statedFare));  // merge current ride and fare record
+            }
 		}
 
 		@Override
 		public void flatMap2(TaxiFare fare, Collector<Tuple2<TaxiRide, TaxiFare>> out) throws Exception {
+            TaxiRide statedRide = rideState.value();
+            if (statedRide == null) {
+                fareState.update(fare);
+            } else {
+                rideState.clear();
+                out.collect(new Tuple2<>(statedRide, fare));
+            }
 		}
 	}
 }
