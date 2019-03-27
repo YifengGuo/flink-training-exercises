@@ -21,6 +21,7 @@ import com.dataartisans.flinktraining.exercises.datastream_java.sources.TaxiRide
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.ExerciseBase;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.MissingSolutionException;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
@@ -28,20 +29,25 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.state.KeyedStateFunction;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.BroadcastStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
 import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction;
 import org.apache.flink.streaming.api.functions.source.SocketTextStreamFunction;
+import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.util.Collector;
 import org.codehaus.commons.compiler.CompileException;
 import org.codehaus.janino.ExpressionEvaluator;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
 
+import javax.annotation.Nullable;
 import java.lang.reflect.InvocationTargetException;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  *
@@ -92,6 +98,18 @@ public class TaxiQueryExercise extends ExerciseBase {
 		// add a socket source for the query stream
 		BroadcastStream<String> queryStream = env
 				.addSource(stringSourceOrTest(new SocketTextStreamFunction("localhost", 9999, "\n", -1)))
+				.assignTimestampsAndWatermarks(new AssignerWithPeriodicWatermarks<String>() {
+					@Nullable
+					@Override
+					public Watermark getCurrentWatermark() {
+						return Watermark.MAX_WATERMARK;
+					}
+
+					@Override
+					public long extractTimestamp(String element, long previousElementTimestamp) {
+						return 0;
+					}
+				})
 				.broadcast(queryDescriptor);
 
 		// connect the two streams and process queries
@@ -127,12 +145,24 @@ public class TaxiQueryExercise extends ExerciseBase {
 				taxiState.update(ride);
 			}
 
-			// TODO: only collect this event if the current query evaluates to TRUE for this ride
-			out.collect(new Tuple2<>("PE@" + timeFormatter.print(ctx.currentWatermark()), ride.toString()));
-
-			throw new MissingSolutionException();
+			// only collect this event if the current query evaluates to TRUE for this ride
+			// processElement() is to process new coming ride info with existed query in broadcast state
+			if (ctx.getBroadcastState(queryDescriptor).immutableEntries().iterator().hasNext()) {
+				ExpressionEvaluator ee = ((Map.Entry<String, ExpressionEvaluator>) ctx.getBroadcastState(queryDescriptor).immutableEntries().iterator().next()).getValue();
+				if (evaluateBooleanExpression(ee, ride, ctx.currentWatermark())) {
+					out.collect(new Tuple2<>("PE@" + timeFormatter.print(ctx.currentWatermark()), ride.toString()));
+				}
+			}
 		}
 
+		/**
+		 * processBroadcastElement() is to process new coming query from socket, which is to apply this
+		 * query with each stored taxi's most up-to-date info
+		 * @param query
+		 * @param ctx
+		 * @param out
+		 * @throws Exception
+		 */
 		@Override
 		public void processBroadcastElement(String query,
 											Context ctx,
@@ -140,13 +170,20 @@ public class TaxiQueryExercise extends ExerciseBase {
 
 			out.collect(new Tuple2<>("QUERY", query));
 
-			// TODO: Store the incoming query in broadcast state
+			// Store the incoming query in broadcast state
+			ctx.getBroadcastState(queryDescriptor).put(QUERY_KEY, cookBooleanExpression(query));
 
-			// TODO: Use applyToKeyedState to process the incoming query with every saved ride
-
-			// TODO: Whenever the query evaluates to TRUE, emit that saved ride
-			//     out.collect(new Tuple2<>("PBE@" + timeFormatter.print(ctx.currentWatermark()), ride.toString()));
-
+			// Use applyToKeyedState to process the incoming query with every saved ride
+			ctx.applyToKeyedState(queryDescriptor, new KeyedStateFunction<Long, State>() {
+				@Override
+				public void process(Long aLong, State state) throws Exception {
+					TaxiRide ride = taxiState.value();
+					// Whenever the query evaluates to TRUE, emit that saved ride
+					if (evaluateBooleanExpression((ExpressionEvaluator) ctx.getBroadcastState(queryDescriptor).get(QUERY_KEY), ride, ctx.currentWatermark())) {
+						out.collect(new Tuple2<>("PBE@" + timeFormatter.print(ctx.currentWatermark()), ride.toString()));
+					}
+				}
+			});
 		}
 
 		private ExpressionEvaluator cookBooleanExpression(String expression) throws CompileException {
