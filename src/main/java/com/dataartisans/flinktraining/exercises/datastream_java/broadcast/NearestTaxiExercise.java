@@ -40,6 +40,8 @@ import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction;
 import org.apache.flink.util.Collector;
 
+import java.util.Iterator;
+import java.util.Map;
 import java.util.Random;
 
 /**
@@ -163,13 +165,13 @@ public class NearestTaxiExercise extends ExerciseBase {
 							"report",
 							// type information of state
 							TypeInformation.of(new TypeHint<Tuple2<Long, Float>>() {}));
-			closest = getRuntimeContext().getState(descriptor);
+			closest = getRuntimeContext().getState(descriptor);  // initialize minima distance state in open()
 		}
 
 		@Override
 		// in and out tuples: (queryId, taxiId, distance)
 		public void processElement(Tuple3<Long, Long, Float> report, Context ctx, Collector<Tuple3<Long, Long, Float>> out) throws Exception {
-			if (closest.value() == null || report.f2 < closest.value().f1) {
+			if (closest.value() == null || report.f2 < closest.value().f1) {  // whenever new tuple3 coming in, compare the current minima state with dis in tuple3
 				closest.update(new Tuple2<>(report.f1, report.f2));
 				out.collect(report);
 			}
@@ -191,7 +193,16 @@ public class NearestTaxiExercise extends ExerciseBase {
 		// Output (queryId, taxiId, euclidean distance) for every query, if the taxi ride is now ending.
 		public void processElement(TaxiRide ride, ReadOnlyContext ctx, Collector<Tuple3<Long, Long, Float>> out) throws Exception {
 			if (!ride.isStart) {
-				throw new MissingSolutionException();
+				// calculate the euclidean distance between ending point and each of query points
+				Iterator it =  ctx.getBroadcastState(queryDescriptor).immutableEntries().iterator();
+				while (it.hasNext()) {
+					Map.Entry<Long, Query> curr = (Map.Entry<Long, Query>) it.next();
+					Query currQuery = curr.getValue();
+					float currLon = currQuery.getLongitude();
+					float currLat = currQuery.getLatitude();
+					float eucDis = (float) ride.getEuclideanDistance(currLon, currLat);
+					out.collect(new Tuple3<>(currQuery.queryId, ride.rideId, eucDis));
+				}
 			}
 		}
 	}
