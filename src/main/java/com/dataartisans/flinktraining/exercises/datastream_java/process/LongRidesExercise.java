@@ -20,6 +20,9 @@ import com.dataartisans.flinktraining.exercises.datastream_java.datatypes.TaxiRi
 import com.dataartisans.flinktraining.exercises.datastream_java.sources.TaxiRideSource;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.MissingSolutionException;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.ExerciseBase;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.TimeCharacteristic;
@@ -68,18 +71,39 @@ public class LongRidesExercise extends ExerciseBase {
 
 	public static class MatchFunction extends KeyedProcessFunction<Long, TaxiRide, TaxiRide> {
 
+		private static final long TWO_HOUR = 2 * 60 * 60 * 1000L;
+
+		private ValueState<TaxiRide> rideState;
+
 		@Override
 		public void open(Configuration config) throws Exception {
-			throw new MissingSolutionException();
+			rideState = getRuntimeContext().getState(new ValueStateDescriptor<>(
+					"saved ride",
+					TypeInformation.of(TaxiRide.class)
+			));
 		}
 
 		@Override
 		public void processElement(TaxiRide ride, Context context, Collector<TaxiRide> out) throws Exception {
+			if (ride.isStart) {
+				// the matching END might have arrived first; don't overwrite it
+				if (rideState.value() == null) {
+					rideState.update(ride);
+				}
+			} else {
+				rideState.update(ride);
+			}
 			TimerService timerService = context.timerService();
+			timerService.registerEventTimeTimer(ride.getEventTime() + TWO_HOUR);
 		}
 
 		@Override
 		public void onTimer(long timestamp, OnTimerContext context, Collector<TaxiRide> out) throws Exception {
+			TaxiRide newestRide = rideState.value();
+			if (newestRide != null && newestRide.isStart) {
+				out.collect(newestRide);
+			}
+			rideState.clear();
 		}
 	}
 }
