@@ -31,11 +31,14 @@ import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.BroadcastStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
 import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction;
+import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.util.Collector;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
 
+import javax.annotation.Nullable;
 import java.util.Locale;
 
 /**
@@ -75,9 +78,13 @@ public class OngoingRidesExercise extends ExerciseBase {
 
 		// add a socket source
 		BroadcastStream<String> queryStream = env.socketTextStream("localhost", 9999)
-				// EXERCISE QUESTION: Is this needed?
-				// .assignTimestampsAndWatermarks(new QueryStreamAssigner())
-				.broadcast(dummyBroadcastState);
+				.assignTimestampsAndWatermarks(new QueryStreamAssigner())
+				.broadcast(dummyBroadcastState);  // use to connect non-broadcast stream with broadcast stream, and we will only use n once for query
+		                                          // so this broadcast state is useless but cannot be ignored
+
+		// BroadcastStream usually contains some rules or parameters which need to be boradcast to every operator downstream
+		// connected with normal stream, we could update or check out rule from broadcast state and do some operation with normal
+		// stream given these rules or parameters
 
 		DataStream<TaxiRide> reports = rides
 				.keyBy((TaxiRide ride) -> ride.taxiId)
@@ -93,25 +100,34 @@ public class OngoingRidesExercise extends ExerciseBase {
 		private ValueStateDescriptor<TaxiRide> taxiDescriptor =
 				new ValueStateDescriptor<>("saved ride", TaxiRide.class);
 
+		private ValueState<TaxiRide> rideState;
+
 		@Override
 		public void open(Configuration config) throws MissingSolutionException {
-			throw new MissingSolutionException();
 			// We use a ValueState<TaxiRide> to store the latest ride event for each taxi.
+			rideState = getRuntimeContext().getState(taxiDescriptor);
 		}
 
 		@Override
 		public void processElement(TaxiRide ride, ReadOnlyContext ctx, Collector< TaxiRide> out) throws Exception {
 			// For every taxi, let's store the most up-to-date information.
 			// TaxiRide implements Comparable to make this easy.
-			throw new MissingSolutionException();
+			TaxiRide savedRide = rideState.value();
+			if (savedRide != null) {
+				if (ride.compareTo(savedRide) >= 0) {  // update state with current taxi's newer info
+					rideState.update(ride);
+				}
+			} else {
+				rideState.update(ride);
+			}
 		}
 
 		@Override
-		public void processBroadcastElement(String msg, Context ctx, Collector<TaxiRide> out) throws Exception {
+		public void processBroadcastElement(String n, Context ctx, Collector<TaxiRide> out) throws Exception {
 			DateTimeFormatter timeFormatter =
 					DateTimeFormat.forPattern("yyyy-MM-dd HH:mm:ss").withLocale(Locale.US).withZoneUTC();
 
-			Long thresholdInMinutes = Long.valueOf(msg);
+			Long thresholdInMinutes = Long.valueOf(n);
 			Long wm = ctx.currentWatermark();
 			System.out.println("QUERY: " + thresholdInMinutes + " minutes at " + timeFormatter.print(wm));
 
@@ -119,10 +135,32 @@ public class OngoingRidesExercise extends ExerciseBase {
 			ctx.applyToKeyedState(taxiDescriptor, new KeyedStateFunction<Long, ValueState<TaxiRide>>() {
 				@Override
 				public void process(Long taxiId, ValueState<TaxiRide> taxiState) throws Exception {
-					throw new MissingSolutionException();
+					TaxiRide ride = taxiState.value();  // checkout the newest info of current taxi
+					if (ride.isStart) {
+						Long durationMinutes = (wm - ride.getEventTime()) / 60000;  // determine if it has been ongoing since n minutes ago
+						if (durationMinutes - thresholdInMinutes >= 0) {
+							out.collect(ride);
+						}
+					}
 				}
 			});
 		}
 	}
 
+	// Once the two streams are connected, the Watermark of the KeyedBroadcastProcessFunction
+	// operator will be the minimum of the Watermarks of the two connected streams. Our query stream
+	// has a default Watermark at Long.MIN_VALUE, and this will hold back the event time clock of
+	// the connected stream, unless we do something about it.
+	public static class QueryStreamAssigner implements AssignerWithPeriodicWatermarks<String> {
+		@Nullable
+		@Override
+		public Watermark getCurrentWatermark() {
+			return Watermark.MAX_WATERMARK;
+		}
+
+		@Override
+		public long extractTimestamp(String element, long previousElementTimestamp) {
+			return 0;
+		}
+	}
 }
