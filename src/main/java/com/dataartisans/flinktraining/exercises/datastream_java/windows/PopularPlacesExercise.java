@@ -21,13 +21,28 @@ import com.dataartisans.flinktraining.exercises.datastream_java.sources.TaxiRide
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.ExerciseBase;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.GeoUtils;
 import com.dataartisans.flinktraining.exercises.datastream_java.utils.MissingSolutionException;
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.java.tuple.Tuple;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple4;
+import org.apache.flink.api.java.tuple.Tuple5;
 import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.windowing.ProcessAllWindowFunction;
+import org.apache.flink.streaming.api.functions.windowing.WindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
+
+import java.util.Comparator;
+import java.util.PriorityQueue;
 
 /**
  * The "Popular Places" exercise of the Flink training
@@ -59,11 +74,38 @@ public class PopularPlacesExercise extends ExerciseBase {
 		DataStream<TaxiRide> rides = env.addSource(rideSourceOrTest(new TaxiRideSource(input, maxEventDelay, servingSpeedFactor)));
 
 		// find n most popular spots
-		DataStream<?> popularPlaces = rides
+		DataStream<Tuple5<Float, Float, Long, Boolean, Long>> popularPlaces = rides
 				// remove all rides which are not within NYC
 				.filter(new NYCFilter())
 				// match ride to grid cell and event type (start or end)
-				.map(new GridCellMatcher());
+				.map(new GridCellMatcher())
+				.keyBy(0, 1)
+				.window(SlidingEventTimeWindows.of(Time.minutes(15), Time.minutes(5)))
+				.apply(new WindowFunction<Tuple2<Integer, Boolean>, Tuple4<Integer, Long, Boolean, Long>, Tuple, TimeWindow>() {
+					@Override
+					public void apply(Tuple key, TimeWindow window, Iterable<Tuple2<Integer, Boolean>> input, Collector<Tuple4<Integer, Long, Boolean, Long>> out) throws Exception {
+						long count = 0L;
+						for (Tuple2<Integer, Boolean> t : input) {
+							count += 1;
+						}
+						int cellId = ((Tuple2<Integer, Boolean>)key).f0;
+						boolean isStart = ((Tuple2<Integer, Boolean>)key).f1;
+						long windowTime = window.getEnd();
+						out.collect(new Tuple4<>(cellId, windowTime, isStart, count));
+					}
+				})
+				.filter(t4 -> t4.f3 >= popThreshold)
+				.map(new MapFunction<Tuple4<Integer, Long, Boolean, Long>, Tuple5<Float, Float, Long, Boolean, Long>>() {
+					@Override
+					public Tuple5<Float, Float, Long, Boolean, Long> map(Tuple4<Integer, Long, Boolean, Long> t) throws Exception {
+						return new Tuple5<>(
+								GeoUtils.getGridCellCenterLon(t.f0),
+								GeoUtils.getGridCellCenterLat(t.f0),
+								t.f1,
+								t.f2,
+								t.f3);
+					}
+				});
 
 		printOrTest(popularPlaces);
 
@@ -78,7 +120,11 @@ public class PopularPlacesExercise extends ExerciseBase {
 
 		@Override
 		public Tuple2<Integer, Boolean> map(TaxiRide taxiRide) throws Exception {
-			throw new MissingSolutionException();
+			if (taxiRide.isStart) {
+				return new Tuple2<>(GeoUtils.mapToGridCell(taxiRide.startLon, taxiRide.startLat), taxiRide.isStart);
+			} else {
+				return new Tuple2<>(GeoUtils.mapToGridCell(taxiRide.endLon, taxiRide.endLat), taxiRide.isStart);
+			}
 		}
 	}
 
